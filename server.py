@@ -6,14 +6,18 @@ Servidor MCP remoto que da acceso al módulo de Proyectos de Odoo (Odoo Online /
 
 Características:
 - Transporte HTTP "streamable" (apto para desplegar en un VPS con Easypanel).
-- Autenticación POR PERSONA: cada miembro del equipo se identifica con su propio
-  login de Odoo + su propia API key, enviados en cabeceras HTTP. Así cada acción
-  queda registrada bajo el usuario real y hereda SUS permisos de Odoo.
+- Autenticación POR PERSONA mediante TOKEN EN LA URL: cada miembro del equipo usa una
+  URL propia con un token opaco, p.ej. https://.../mcp/ab12cd34. El servidor mapea cada
+  token a un (login + API key) de Odoo, guardados en la variable de entorno ODOO_USERS.
+  Así cada acción queda registrada bajo el usuario real y hereda SUS permisos de Odoo,
+  sin que la API key viaje nunca dentro de la URL.
+  (Se eligió este método porque el conector de Claude no reenvía cabeceras HTTP
+  personalizadas al servidor; la URL sí llega siempre intacta.)
 - CRUD completo sobre Proyectos: proyectos, tareas, etapas, partes de horas (timesheets)
   e hitos, incluido el borrado.
 
 La URL y la base de datos de Odoo son a nivel de servidor (misma instancia para todos);
-solo las credenciales del usuario cambian por persona.
+solo el token (y por tanto la identidad) cambia por persona.
 
 Modelos de Odoo usados:
   project.project          -> proyectos
@@ -30,16 +34,16 @@ la clase OdooClient para facilitar esa migración sin tocar las herramientas.
 
 from __future__ import annotations
 
-import base64
-import binascii
+import contextvars
+import json
 import logging
 import os
+import re
 import xmlrpc.client
 from dataclasses import dataclass
 from typing import Any
 
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_http_headers
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("odoo-mcp")
@@ -51,21 +55,74 @@ logger = logging.getLogger("odoo-mcp")
 ODOO_URL = os.environ.get("ODOO_URL", "").rstrip("/")   # p.ej. https://miempresa.odoo.com
 ODOO_DB = os.environ.get("ODOO_DB", "")                 # nombre de la base de datos
 
-# Credenciales de respaldo OPCIONALES. Se usan solo si una petición no trae cabeceras
-# de usuario. En un despliegue de equipo se recomienda dejarlas vacías y forzar
-# identidad por persona (ver AUTH_MODE).
-FALLBACK_LOGIN = os.environ.get("ODOO_FALLBACK_LOGIN", "")
-FALLBACK_API_KEY = os.environ.get("ODOO_FALLBACK_API_KEY", "")
-
-# "per_user"  -> exige cabeceras X-Odoo-Login / X-Odoo-Api-Key en cada petición.
-# "fallback"  -> si faltan cabeceras, usa las credenciales de respaldo de arriba.
-AUTH_MODE = os.environ.get("ODOO_AUTH_MODE", "per_user").lower()
+# El endpoint MCP se monta en este path. La URL de cada usuario será:
+#   https://<dominio><MCP_PATH>/<su-token>
+MCP_PATH = os.environ.get("MCP_PATH", "/mcp")
 
 if not ODOO_URL or not ODOO_DB:
     raise RuntimeError(
         "Faltan variables de entorno obligatorias: ODOO_URL y ODOO_DB. "
         "Configúralas en Easypanel antes de arrancar el servicio."
     )
+
+
+# --------------------------------------------------------------------------- #
+# Mapa de usuarios: token -> (login de Odoo, API key personal)
+# --------------------------------------------------------------------------- #
+#
+# Se define en la variable de entorno ODOO_USERS. Dos formatos aceptados:
+#
+#   1) Líneas 'token|login|api_key' (recomendado, fácil de editar en Easypanel):
+#        ab12cd34|oswaldo@zuhma.online|0123456789abcdef...
+#        ef56gh78|maria@zuhma.online|fedcba9876543210...
+#      (separadas por saltos de línea o por ';')
+#
+#   2) JSON:
+#        {"ab12cd34": {"login": "oswaldo@zuhma.online", "api_key": "..."}, ...}
+#
+# Los tokens deben ser aleatorios e impredecibles. Genera uno con:
+#        python3 -c "import secrets; print(secrets.token_urlsafe(12))"
+
+
+def _load_users() -> dict[str, dict[str, str]]:
+    raw = os.environ.get("ODOO_USERS", "").strip()
+    if not raw:
+        return {}
+    if raw.lstrip().startswith("{"):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"ODOO_USERS no es un JSON válido: {exc}") from exc
+        return {
+            str(token): {"login": v["login"], "api_key": v["api_key"]}
+            for token, v in data.items()
+        }
+    users: dict[str, dict[str, str]] = {}
+    for line in re.split(r"[;\n]+", raw):
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) != 3 or not all(parts):
+            raise RuntimeError(
+                f"Entrada inválida en ODOO_USERS: {line!r}. "
+                "Formato esperado: token|login|api_key"
+            )
+        token, login, api_key = parts
+        users[token] = {"login": login, "api_key": api_key}
+    return users
+
+
+USERS = _load_users()
+if not USERS:
+    logger.warning(
+        "ODOO_USERS está vacío: ningún usuario podrá autenticarse hasta que lo configures."
+    )
+else:
+    logger.info("ODOO_USERS cargado con %d usuario(s).", len(USERS))
+
+# Token del usuario de la petición en curso (lo fija el middleware por cada request).
+_current_token: contextvars.ContextVar[str] = contextvars.ContextVar("odoo_token", default="")
 
 
 # --------------------------------------------------------------------------- #
@@ -145,88 +202,23 @@ class OdooClient:
         return self.execute(model, "unlink", [ids])
 
 
-# Nombres de cabecera aceptados para el login y la API key. Distintas interfaces
-# de conectores usan nombres distintos, así que aceptamos varias variantes.
-_LOGIN_HEADERS = (
-    "x-odoo-login", "x-odoo-username", "x-odoo-user", "x-odoo-email",
-    "odoo-login", "odoo-username", "x-username", "x-user",
-)
-_APIKEY_HEADERS = (
-    "x-odoo-api-key", "x-odoo-apikey", "x-odoo-key", "x-odoo-token",
-    "odoo-api-key", "x-api-key", "x-apikey", "api-key",
-)
-
-
-def _extract_credentials(headers: dict[str, str]) -> tuple[str, str]:
-    """Intenta obtener (login, api_key) de la petición, en este orden:
-
-    1) Cabeceras dedicadas (varias variantes de nombre).
-    2) Autenticación básica HTTP: 'Authorization: Basic base64(login:api_key)'.
-       (Muchas UIs de conectores exponen 'usuario/contraseña' que se envían así.)
-    3) Bearer token con formato 'login:api_key': 'Authorization: Bearer login:key'.
-    """
-    login = ""
-    api_key = ""
-
-    for name in _LOGIN_HEADERS:
-        if headers.get(name):
-            login = headers[name].strip()
-            break
-    for name in _APIKEY_HEADERS:
-        if headers.get(name):
-            api_key = headers[name].strip()
-            break
-
-    if login and api_key:
-        return login, api_key
-
-    # Fallback: cabecera Authorization
-    auth = headers.get("authorization", "").strip()
-    if auth:
-        scheme, _, value = auth.partition(" ")
-        scheme = scheme.lower()
-        if scheme == "basic" and value:
-            try:
-                decoded = base64.b64decode(value).decode("utf-8", "replace")
-                user, _, pwd = decoded.partition(":")
-                login = login or user.strip()
-                api_key = api_key or pwd.strip()
-            except (binascii.Error, ValueError):
-                pass
-        elif scheme == "bearer" and ":" in value:
-            user, _, pwd = value.partition(":")
-            login = login or user.strip()
-            api_key = api_key or pwd.strip()
-
-    return login, api_key
-
-
 def _client_from_request() -> OdooClient:
-    """Construye un OdooClient con las credenciales del usuario que hace la petición.
-
-    Cada miembro del equipo aporta su login de Odoo y su API key personal a través del
-    conector de Claude (como cabeceras dedicadas o como autenticación básica).
-    """
-    headers = get_http_headers()
-    login, api_key = _extract_credentials(headers)
-
-    if not login or not api_key:
-        if AUTH_MODE == "fallback" and FALLBACK_LOGIN and FALLBACK_API_KEY:
-            login, api_key = FALLBACK_LOGIN, FALLBACK_API_KEY
-        else:
-            # Log de diagnóstico: nombres de cabecera recibidos (sin valores sensibles)
-            recibidas = sorted(headers.keys())
-            logger.warning(
-                "Petición sin credenciales válidas. Cabeceras recibidas: %s", recibidas
-            )
-            raise OdooError(
-                "Faltan credenciales. El conector no está enviando tu login y API key "
-                "de Odoo de forma reconocible. Nombres de cabecera aceptados: "
-                "X-Odoo-Login / X-Odoo-Api-Key (o autenticación básica usuario:api_key). "
-                f"El servidor recibió estas cabeceras: {sorted(headers.keys())}."
-            )
-
-    return OdooClient(ODOO_URL, ODOO_DB, OdooCredentials(login, api_key))
+    """Construye un OdooClient con las credenciales del usuario que hace la petición,
+    resueltas a partir del token presente en su URL (p.ej. .../mcp/<token>)."""
+    token = _current_token.get()
+    if not token:
+        raise OdooError(
+            "Falta el token en la URL. Tu conector debe apuntar a "
+            f"'{MCP_PATH}/<tu-token>' y no solo a '{MCP_PATH}'. "
+            "Pide tu URL personal al administrador."
+        )
+    entry = USERS.get(token)
+    if not entry:
+        raise OdooError(
+            "Token no reconocido. Verifica que tu URL personal sea correcta o pide al "
+            "administrador que te dé de alta en la variable ODOO_USERS."
+        )
+    return OdooClient(ODOO_URL, ODOO_DB, OdooCredentials(entry["login"], entry["api_key"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -567,8 +559,51 @@ def find_users(query: str, limit: int = 10) -> list[dict]:
 # Arranque
 # --------------------------------------------------------------------------- #
 
+class TokenPathMiddleware:
+    """Middleware ASGI puro.
+
+    Convierte la URL personal de cada usuario, '<MCP_PATH>/<token>', en la ruta que
+    FastMCP espera ('<MCP_PATH>'), y deja el token disponible para las herramientas
+    a través de un ContextVar. Cualquier scope que no sea HTTP (p.ej. 'lifespan') se
+    reenvía tal cual para no romper el arranque del gestor de sesiones.
+    """
+
+    def __init__(self, app, mount_path: str):
+        self.app = app
+        self.mount_path = mount_path.rstrip("/")
+        self.prefix = self.mount_path + "/"
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        token = ""
+        if path.startswith(self.prefix):
+            token = path[len(self.prefix):].strip("/")
+            scope = dict(scope)
+            scope["path"] = self.mount_path
+            scope["raw_path"] = self.mount_path.encode("utf-8")
+
+        reset = _current_token.set(token)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _current_token.reset(reset)
+
+
 if __name__ == "__main__":
+    import uvicorn
+
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
-    # Transporte HTTP "streamable"; el endpoint MCP queda en http://<host>:<port>/mcp
-    mcp.run(transport="http", host=host, port=port)
+
+    # App ASGI de FastMCP (transporte HTTP streamable) montada en MCP_PATH,
+    # envuelta por el middleware que resuelve el token de la URL.
+    inner = mcp.http_app(path=MCP_PATH)
+    app = TokenPathMiddleware(inner, mount_path=MCP_PATH)
+
+    logger.info("Escuchando en http://%s:%s%s/<token>", host, port, MCP_PATH)
+    # Se pasa el lifespan del app interno para que arranque el session manager de MCP.
+    uvicorn.run(app, host=host, port=port, lifespan="on")

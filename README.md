@@ -3,7 +3,7 @@
 Servidor MCP remoto que da a Claude acceso al **módulo de Proyectos de Odoo** (Odoo Online / SaaS Custom), pensado para que **varios miembros de un equipo** lo usen, cada uno con **su propia identidad de Odoo**.
 
 - **CRUD completo** sobre proyectos, tareas, etapas, partes de horas (timesheets) e hitos, incluido el borrado.
-- **Autenticación por persona**: cada usuario envía su login y su API key personal en cabeceras HTTP, así cada acción queda registrada bajo el usuario real y respeta sus permisos de Odoo.
+- **Autenticación por persona mediante token en la URL**: cada usuario tiene una URL propia (`https://<dominio>/mcp/<token>`). El servidor mapea cada token a un login + API key de Odoo, guardados en la variable de entorno `ODOO_USERS`. Así cada acción queda registrada bajo el usuario real y respeta sus permisos de Odoo, **sin que la API key viaje nunca en la URL**. *(Se usa este método porque el conector de Claude no reenvía cabeceras HTTP personalizadas; la URL sí llega siempre intacta.)*
 - Desplegable en un **VPS con Easypanel** (que además gestiona el dominio y el certificado HTTPS automáticamente).
 
 ---
@@ -70,41 +70,51 @@ Luego expón el contenedor con un dominio en Easypanel apuntando al puerto 8000.
 |---|---|---|
 | `ODOO_URL` | `https://tuempresa.odoo.com` (sin barra final) | Sí |
 | `ODOO_DB` | nombre de la base de datos (suele ser el subdominio) | Sí |
-| `ODOO_AUTH_MODE` | `per_user` | Sí |
-| `ODOO_FALLBACK_LOGIN` | vacío | No |
-| `ODOO_FALLBACK_API_KEY` | vacío | No |
+| `ODOO_USERS` | mapa `token\|login\|api_key`, una línea por usuario (ver 3.2) | Sí |
+| `MCP_PATH` | `/mcp` (por defecto; normalmente no cambiar) | No |
 | `PORT` | `8000` | No |
 
 Ver `.env.example` para el detalle.
 
-### 3.2 Comprobar que arrancó
+### 3.2 Dar de alta a cada usuario en `ODOO_USERS`
 
-El endpoint MCP queda en:
+Cada persona necesita un **token** (aleatorio) asociado a su **login + API key** de Odoo. El valor de `ODOO_USERS` es una línea por usuario con el formato `token|login|api_key`:
 
 ```
-https://odoo-mcp.tudominio.com/mcp
+2NkgNSerM5dtSWId|oswaldo@zuhma.online|API_KEY_DE_OSWALDO
+9qe2N4Ubcm24qEPH|maria@zuhma.online|API_KEY_DE_MARIA
 ```
 
-En los logs de Easypanel deberías ver que el servidor arranca en el puerto 8000. (El endpoint `/mcp` responde a clientes MCP, no a un navegador normal.)
+Genera tokens seguros con:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(12))"
+```
+
+La **URL personal** de cada quien será entonces:
+
+```
+https://odoo-mcp.tudominio.com/mcp/<su-token>
+```
+
+> Para añadir o quitar usuarios: edita `ODOO_USERS` en Easypanel y vuelve a desplegar. Revocar a alguien = borrar su línea (o su API key en Odoo).
+
+### 3.3 Comprobar que arrancó
+
+Abre en el navegador la URL personal de un usuario, p. ej. `https://odoo-mcp.tudominio.com/mcp/<token>`. Si responde con un JSON tipo `"Not Acceptable: Client must accept text/event-stream"`, **está funcionando** (el endpoint MCP está vivo; un navegador no completa el handshake). En los logs de Easypanel verás `ODOO_USERS cargado con N usuario(s)` y `Application startup complete`.
 
 ---
 
 ## 4. Cómo conecta cada miembro del equipo (en Claude)
 
-Cada persona añade el conector **una vez**, poniendo **sus propias** credenciales en las cabeceras:
+Cada persona añade el conector **una vez** con su **URL personal** (que ya lleva su token):
 
-1. En Claude → **Settings / Ajustes → Connectors** → **Add custom connector**.
-2. **URL**: `https://odoo-mcp.tudominio.com/mcp`
-3. En **Headers / Cabeceras** (o "configuración avanzada" del conector) añade:
+1. En Claude → **Settings / Ajustes → Connectors / Conectores** → **Add custom connector**.
+2. **Name / Nombre**: `Odoo Proyectos`
+3. **URL**: `https://odoo-mcp.tudominio.com/mcp/<su-token>`
+4. Guardar. Listo: a partir de ahí Claude actúa en Odoo **como esa persona**. No hay que configurar cabeceras ni credenciales en Claude.
 
-   | Cabecera | Valor |
-   |---|---|
-   | `X-Odoo-Login` | su email/login de Odoo |
-   | `X-Odoo-Api-Key` | su API key personal (paso 2.2) |
-
-4. Guardar. Listo: a partir de ahí Claude actúa en Odoo **como esa persona**.
-
-> Si la interfaz de conectores que uses no permitiera añadir cabeceras personalizadas, avísame y adaptamos el servidor para recibir la credencial de otra forma (por ejemplo un token por usuario en la ruta). También se puede evolucionar a **OAuth** para identidad completa sin manejar API keys.
+> El token va en la URL, pero la **API key no**: el servidor la resuelve internamente. Aun así, trata la URL personal como un secreto (quien la tenga actúa como ese usuario). Para revocar, borra la línea del usuario en `ODOO_USERS` y redepliega.
 
 ---
 
@@ -127,8 +137,9 @@ Ejemplos de cosas que le puedes pedir a Claude:
 
 ## 6. Notas de seguridad
 
-- **Nunca** pongas las API keys en el código ni en el repositorio: van en cabeceras (por usuario) o en variables de entorno de Easypanel.
-- Sirve el MCP **siempre por HTTPS** (Easypanel lo hace por defecto). Las cabeceras viajan cifradas.
-- Los permisos efectivos son los del usuario de Odoo: para restringir a alguien, ajusta su rol en Odoo.
-- Puedes revocar el acceso de una persona borrando su API key en Odoo, sin afectar al resto.
-- Si `ODOO_AUTH_MODE=per_user`, una petición sin cabeceras válidas es rechazada (no hay acceso anónimo).
+- **Nunca** pongas las API keys en el código ni en el repositorio: viven solo en la variable `ODOO_USERS` de Easypanel (y el `.env` está en `.gitignore`).
+- Sirve el MCP **siempre por HTTPS** (Easypanel lo hace por defecto): la URL con el token viaja cifrada.
+- La **API key nunca va en la URL**; el servidor la resuelve desde el token. Aun así, la URL personal es un secreto: quien la tenga actúa como ese usuario.
+- Los permisos efectivos son los del usuario de Odoo: para restringir a alguien (p. ej. solo lectura), ajusta su rol/grupos en Odoo.
+- Para **revocar** a una persona: borra su línea en `ODOO_USERS` (y/o su API key en Odoo) y vuelve a desplegar. No afecta al resto.
+- Una petición sin token o con un token desconocido es rechazada: **no hay acceso anónimo**.
