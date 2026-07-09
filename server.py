@@ -30,6 +30,9 @@ la clase OdooClient para facilitar esa migración sin tocar las herramientas.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import logging
 import os
 import xmlrpc.client
 from dataclasses import dataclass
@@ -37,6 +40,9 @@ from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("odoo-mcp")
 
 # --------------------------------------------------------------------------- #
 # Configuración a nivel de servidor (compartida por todo el equipo)
@@ -139,25 +145,85 @@ class OdooClient:
         return self.execute(model, "unlink", [ids])
 
 
+# Nombres de cabecera aceptados para el login y la API key. Distintas interfaces
+# de conectores usan nombres distintos, así que aceptamos varias variantes.
+_LOGIN_HEADERS = (
+    "x-odoo-login", "x-odoo-username", "x-odoo-user", "x-odoo-email",
+    "odoo-login", "odoo-username", "x-username", "x-user",
+)
+_APIKEY_HEADERS = (
+    "x-odoo-api-key", "x-odoo-apikey", "x-odoo-key", "x-odoo-token",
+    "odoo-api-key", "x-api-key", "x-apikey", "api-key",
+)
+
+
+def _extract_credentials(headers: dict[str, str]) -> tuple[str, str]:
+    """Intenta obtener (login, api_key) de la petición, en este orden:
+
+    1) Cabeceras dedicadas (varias variantes de nombre).
+    2) Autenticación básica HTTP: 'Authorization: Basic base64(login:api_key)'.
+       (Muchas UIs de conectores exponen 'usuario/contraseña' que se envían así.)
+    3) Bearer token con formato 'login:api_key': 'Authorization: Bearer login:key'.
+    """
+    login = ""
+    api_key = ""
+
+    for name in _LOGIN_HEADERS:
+        if headers.get(name):
+            login = headers[name].strip()
+            break
+    for name in _APIKEY_HEADERS:
+        if headers.get(name):
+            api_key = headers[name].strip()
+            break
+
+    if login and api_key:
+        return login, api_key
+
+    # Fallback: cabecera Authorization
+    auth = headers.get("authorization", "").strip()
+    if auth:
+        scheme, _, value = auth.partition(" ")
+        scheme = scheme.lower()
+        if scheme == "basic" and value:
+            try:
+                decoded = base64.b64decode(value).decode("utf-8", "replace")
+                user, _, pwd = decoded.partition(":")
+                login = login or user.strip()
+                api_key = api_key or pwd.strip()
+            except (binascii.Error, ValueError):
+                pass
+        elif scheme == "bearer" and ":" in value:
+            user, _, pwd = value.partition(":")
+            login = login or user.strip()
+            api_key = api_key or pwd.strip()
+
+    return login, api_key
+
+
 def _client_from_request() -> OdooClient:
     """Construye un OdooClient con las credenciales del usuario que hace la petición.
 
-    Cada miembro del equipo configura estas dos cabeceras en su conector de Claude:
-        X-Odoo-Login    -> su email / login de Odoo
-        X-Odoo-Api-Key  -> su API key personal de Odoo
+    Cada miembro del equipo aporta su login de Odoo y su API key personal a través del
+    conector de Claude (como cabeceras dedicadas o como autenticación básica).
     """
     headers = get_http_headers()
-    login = headers.get("x-odoo-login", "").strip()
-    api_key = headers.get("x-odoo-api-key", "").strip()
+    login, api_key = _extract_credentials(headers)
 
     if not login or not api_key:
         if AUTH_MODE == "fallback" and FALLBACK_LOGIN and FALLBACK_API_KEY:
             login, api_key = FALLBACK_LOGIN, FALLBACK_API_KEY
         else:
+            # Log de diagnóstico: nombres de cabecera recibidos (sin valores sensibles)
+            recibidas = sorted(headers.keys())
+            logger.warning(
+                "Petición sin credenciales válidas. Cabeceras recibidas: %s", recibidas
+            )
             raise OdooError(
-                "Faltan credenciales. Configura las cabeceras 'X-Odoo-Login' y "
-                "'X-Odoo-Api-Key' con tu login y tu API key personal de Odoo en el "
-                "conector de Claude."
+                "Faltan credenciales. El conector no está enviando tu login y API key "
+                "de Odoo de forma reconocible. Nombres de cabecera aceptados: "
+                "X-Odoo-Login / X-Odoo-Api-Key (o autenticación básica usuario:api_key). "
+                f"El servidor recibió estas cabeceras: {sorted(headers.keys())}."
             )
 
     return OdooClient(ODOO_URL, ODOO_DB, OdooCredentials(login, api_key))
