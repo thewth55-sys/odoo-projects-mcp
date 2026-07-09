@@ -35,15 +35,21 @@ la clase OdooClient para facilitar esa migración sin tocar las herramientas.
 from __future__ import annotations
 
 import contextvars
+import html
 import json
 import logging
 import os
 import re
+import secrets
+import threading
 import xmlrpc.client
 from dataclasses import dataclass
 from typing import Any
 
+import anyio
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import HTMLResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("odoo-mcp")
@@ -113,13 +119,74 @@ def _load_users() -> dict[str, dict[str, str]]:
     return users
 
 
-USERS = _load_users()
+# --------------------------------------------------------------------------- #
+# Persistencia de usuarios auto-registrados (Opción 1: /enroll)
+# --------------------------------------------------------------------------- #
+#
+# Los usuarios que se dan de alta solos se guardan en un archivo JSON dentro de un
+# VOLUMEN PERSISTENTE, para sobrevivir a reinicios y redeploys sin tocar Easypanel.
+#
+#   ODOO_USERS_FILE : ruta del archivo (por defecto /data/users.json; monta /data como volumen)
+#   ENROLL_SECRET   : clave de invitación para poder auto-registrarse (si está vacía, /enroll se deshabilita)
+#   PUBLIC_BASE_URL : URL pública base para construir el enlace personal (opcional; si falta se deduce de la petición)
+
+USERS_FILE = os.environ.get("ODOO_USERS_FILE", "/data/users.json")
+ENROLL_SECRET = os.environ.get("ENROLL_SECRET", "")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+
+_users_lock = threading.Lock()
+
+
+def _load_users_from_file() -> dict[str, dict[str, str]]:
+    try:
+        with open(USERS_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("No se pudo leer %s: %s", USERS_FILE, exc)
+        return {}
+    return {
+        str(token): {"login": v["login"], "api_key": v["api_key"]}
+        for token, v in data.items()
+    }
+
+
+def _save_users_to_file(users: dict[str, dict[str, str]]) -> None:
+    os.makedirs(os.path.dirname(USERS_FILE) or ".", exist_ok=True)
+    tmp = USERS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(users, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, USERS_FILE)  # escritura atómica
+
+
+# Usuarios en memoria = definidos por variable de entorno (semilla) + auto-registrados (archivo).
+# Los del archivo tienen prioridad si hubiera colisión de token.
+_env_users = _load_users()
+_file_users = _load_users_from_file()
+USERS: dict[str, dict[str, str]] = {**_env_users, **_file_users}
+
 if not USERS:
     logger.warning(
-        "ODOO_USERS está vacío: ningún usuario podrá autenticarse hasta que lo configures."
+        "No hay usuarios cargados todavía. Da de alta con ODOO_USERS o mediante /enroll."
     )
 else:
-    logger.info("ODOO_USERS cargado con %d usuario(s).", len(USERS))
+    logger.info(
+        "Usuarios cargados: %d (env: %d, archivo: %d).",
+        len(USERS), len(_env_users), len(_file_users),
+    )
+
+
+def _register_user(login: str, api_key: str) -> str:
+    """Añade un usuario y devuelve su token. Persiste en archivo y en memoria."""
+    token = secrets.token_urlsafe(12)
+    with _users_lock:
+        stored = _load_users_from_file()
+        stored[token] = {"login": login, "api_key": api_key}
+        _save_users_to_file(stored)
+        USERS[token] = {"login": login, "api_key": api_key}
+    return token
+
 
 # Token del usuario de la petición en curso (lo fija el middleware por cada request).
 _current_token: contextvars.ContextVar[str] = contextvars.ContextVar("odoo_token", default="")
@@ -558,6 +625,123 @@ def find_users(query: str, limit: int = 10) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # Arranque
 # --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# Auto-registro de usuarios: página web /enroll
+# --------------------------------------------------------------------------- #
+
+_PAGE = """<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alta - Odoo Proyectos MCP</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f4f5f7;
+       margin:0;padding:40px 16px;color:#1f2733}
+  .card{max-width:460px;margin:0 auto;background:#fff;border-radius:14px;
+        box-shadow:0 6px 24px rgba(0,0,0,.08);padding:28px 26px}
+  h1{font-size:20px;margin:0 0 6px}
+  p.sub{color:#5b6472;margin:0 0 20px;font-size:14px;line-height:1.5}
+  label{display:block;font-size:13px;font-weight:600;margin:14px 0 6px}
+  input{width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #d3d8e0;
+        border-radius:9px;font-size:14px}
+  button{margin-top:22px;width:100%;padding:12px;border:0;border-radius:9px;
+         background:#7b3fe4;color:#fff;font-size:15px;font-weight:600;cursor:pointer}
+  button:hover{background:#6a30cf}
+  .msg{padding:11px 13px;border-radius:9px;font-size:13.5px;margin-bottom:16px;line-height:1.45}
+  .err{background:#fdecec;color:#a12622;border:1px solid #f5c2c0}
+  .ok{background:#e8f7ee;color:#1a7a42;border:1px solid #bde5cc}
+  code{background:#f0eefb;color:#5a29b8;padding:2px 6px;border-radius:6px;
+       word-break:break-all;font-size:13px}
+  .hint{font-size:12px;color:#7a828e;margin-top:6px}
+</style></head>
+<body><div class="card">__BODY__</div></body></html>"""
+
+_FORM_BODY = """<h1>Conectar Odoo Proyectos</h1>
+<p class="sub">Regístrate para obtener tu enlace personal de conexión con Claude.
+Tus credenciales se validan contra Odoo y se guardan de forma segura en el servidor.</p>
+__MSG__
+<form method="post" action="enroll" autocomplete="off">
+  <label>Clave de invitación</label>
+  <input name="invite" type="password" required placeholder="La que te dio tu administrador">
+  <label>Tu correo / login de Odoo</label>
+  <input name="login" type="email" required placeholder="tucorreo@empresa.com">
+  <label>Tu API key de Odoo</label>
+  <input name="api_key" type="password" required placeholder="Perfil - Seguridad de la cuenta - Nueva clave de API">
+  <div class="hint">En Odoo: tu avatar - Mi perfil - Seguridad de la cuenta - Nueva clave de API.</div>
+  <button type="submit">Generar mi enlace</button>
+</form>"""
+
+
+def _render_form(message_html: str = "") -> HTMLResponse:
+    body = _FORM_BODY.replace("__MSG__", message_html)
+    return HTMLResponse(_PAGE.replace("__BODY__", body))
+
+
+def _validate_odoo(login: str, api_key: str) -> bool:
+    """Comprueba que (login, api_key) autentican correctamente en Odoo."""
+    try:
+        _ = OdooClient(ODOO_URL, ODOO_DB, OdooCredentials(login, api_key)).uid
+        return True
+    except OdooError:
+        return False
+
+
+def _base_url(request: Request) -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+    return f"{proto}://{host}"
+
+
+@mcp.custom_route("/enroll", methods=["GET"])
+async def enroll_form(request: Request) -> HTMLResponse:
+    if not ENROLL_SECRET:
+        return HTMLResponse(
+            _PAGE.replace("__BODY__", "<h1>Registro deshabilitado</h1>"
+                          "<p class='sub'>El administrador no ha activado el auto-registro.</p>"),
+            status_code=403,
+        )
+    return _render_form()
+
+
+@mcp.custom_route("/enroll", methods=["POST"])
+async def enroll_submit(request: Request) -> HTMLResponse:
+    if not ENROLL_SECRET:
+        return HTMLResponse("Registro deshabilitado.", status_code=403)
+
+    form = await request.form()
+    invite = str(form.get("invite", "")).strip()
+    login = str(form.get("login", "")).strip()
+    api_key = str(form.get("api_key", "")).strip()
+
+    if not secrets.compare_digest(invite, ENROLL_SECRET):
+        return _render_form("<div class='msg err'>Clave de invitación incorrecta.</div>")
+    if not login or not api_key:
+        return _render_form("<div class='msg err'>Completa tu correo y tu API key.</div>")
+
+    valid = await anyio.to_thread.run_sync(_validate_odoo, login, api_key)
+    if not valid:
+        return _render_form(
+            "<div class='msg err'>Odoo rechazó esas credenciales. Revisa tu correo y "
+            "tu API key (y que tu usuario tenga contraseña establecida en Odoo Online).</div>"
+        )
+
+    token = await anyio.to_thread.run_sync(_register_user, login, api_key)
+    personal_url = f"{_base_url(request)}{MCP_PATH}/{token}"
+    logger.info("Nuevo usuario auto-registrado: %s", login)
+
+    body = (
+        "<h1>¡Listo!</h1>"
+        f"<div class='msg ok'>Registrado como <b>{html.escape(login)}</b>.</div>"
+        "<p class='sub'>Copia tu enlace personal y pégalo en Claude "
+        "(Ajustes → Conectores → Añadir conector personalizado, como URL):</p>"
+        f"<p><code>{html.escape(personal_url)}</code></p>"
+        "<p class='hint'>Trátalo como un secreto: quien tenga este enlace actúa como tú "
+        "en Odoo. Si lo pierdes, vuelve a registrarte para generar uno nuevo.</p>"
+    )
+    return HTMLResponse(_PAGE.replace("__BODY__", body))
+
 
 class TokenPathMiddleware:
     """Middleware ASGI puro.

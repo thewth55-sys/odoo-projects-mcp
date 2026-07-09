@@ -3,7 +3,8 @@
 Servidor MCP remoto que da a Claude acceso al **módulo de Proyectos de Odoo** (Odoo Online / SaaS Custom), pensado para que **varios miembros de un equipo** lo usen, cada uno con **su propia identidad de Odoo**.
 
 - **CRUD completo** sobre proyectos, tareas, etapas, partes de horas (timesheets) e hitos, incluido el borrado.
-- **Autenticación por persona mediante token en la URL**: cada usuario tiene una URL propia (`https://<dominio>/mcp/<token>`). El servidor mapea cada token a un login + API key de Odoo, guardados en la variable de entorno `ODOO_USERS`. Así cada acción queda registrada bajo el usuario real y respeta sus permisos de Odoo, **sin que la API key viaje nunca en la URL**. *(Se usa este método porque el conector de Claude no reenvía cabeceras HTTP personalizadas; la URL sí llega siempre intacta.)*
+- **Autenticación por persona mediante token en la URL**: cada usuario tiene una URL propia (`https://<dominio>/mcp/<token>`). El servidor mapea cada token a un login + API key de Odoo. Así cada acción queda registrada bajo el usuario real y respeta sus permisos de Odoo, **sin que la API key viaje nunca en la URL**. *(Se usa este método porque el conector de Claude no reenvía cabeceras HTTP personalizadas; la URL sí llega siempre intacta.)*
+- **Auto-registro (self-service)**: los usuarios se dan de alta solos en la página `/enroll` con una clave de invitación. El servidor valida sus credenciales contra Odoo y guarda el mapa en un **volumen persistente**. El administrador no tiene que editar variables ni redesplegar por cada persona.
 - Desplegable en un **VPS con Easypanel** (que además gestiona el dominio y el certificado HTTPS automáticamente).
 
 ---
@@ -70,51 +71,43 @@ Luego expón el contenedor con un dominio en Easypanel apuntando al puerto 8000.
 |---|---|---|
 | `ODOO_URL` | `https://tuempresa.odoo.com` (sin barra final) | Sí |
 | `ODOO_DB` | nombre de la base de datos (suele ser el subdominio) | Sí |
-| `ODOO_USERS` | mapa `token\|login\|api_key`, una línea por usuario (ver 3.2) | Sí |
+| `ENROLL_SECRET` | clave de invitación para el auto-registro en `/enroll` | Sí (para self-service) |
+| `ODOO_USERS_FILE` | `/data/users.json` (debe estar en un volumen persistente) | Sí (para self-service) |
+| `PUBLIC_BASE_URL` | `https://odoo-mcp.tudominio.com` (para armar el enlace personal) | Recomendada |
+| `ODOO_USERS` | mapa `token\|login\|api_key` (opcional, para sembrar usuarios manualmente) | No |
 | `MCP_PATH` | `/mcp` (por defecto; normalmente no cambiar) | No |
 | `PORT` | `8000` | No |
 
 Ver `.env.example` para el detalle.
 
-### 3.2 Dar de alta a cada usuario en `ODOO_USERS`
+### 3.2 Añadir el volumen persistente (una sola vez)
 
-Cada persona necesita un **token** (aleatorio) asociado a su **login + API key** de Odoo. El valor de `ODOO_USERS` es una línea por usuario con el formato `token|login|api_key`:
+Para que los usuarios auto-registrados sobrevivan a reinicios y redeploys, monta un volumen:
 
-```
-2NkgNSerM5dtSWId|oswaldo@zuhma.online|API_KEY_DE_OSWALDO
-9qe2N4Ubcm24qEPH|maria@zuhma.online|API_KEY_DE_MARIA
-```
+1. En Easypanel → tu servicio → **Mounts / Volúmenes** → **Add Volume**.
+2. Tipo **Volume**, con un nombre (p. ej. `odoo-mcp-data`) y **Mount Path** = `/data`.
+3. Guarda y redepliega.
 
-Genera tokens seguros con:
-
-```bash
-python3 -c "import secrets; print(secrets.token_urlsafe(12))"
-```
-
-La **URL personal** de cada quien será entonces:
-
-```
-https://odoo-mcp.tudominio.com/mcp/<su-token>
-```
-
-> Para añadir o quitar usuarios: edita `ODOO_USERS` en Easypanel y vuelve a desplegar. Revocar a alguien = borrar su línea (o su API key en Odoo).
+Así el archivo `/data/users.json` (donde se guardan los registros) persiste siempre.
 
 ### 3.3 Comprobar que arrancó
 
-Abre en el navegador la URL personal de un usuario, p. ej. `https://odoo-mcp.tudominio.com/mcp/<token>`. Si responde con un JSON tipo `"Not Acceptable: Client must accept text/event-stream"`, **está funcionando** (el endpoint MCP está vivo; un navegador no completa el handshake). En los logs de Easypanel verás `ODOO_USERS cargado con N usuario(s)` y `Application startup complete`.
+Abre en el navegador `https://odoo-mcp.tudominio.com/enroll`: debe aparecer el **formulario de alta**. En los logs de Easypanel verás `Application startup complete`.
 
 ---
 
-## 4. Cómo conecta cada miembro del equipo (en Claude)
+## 4. Cómo se da de alta y conecta cada miembro del equipo
 
-Cada persona añade el conector **una vez** con su **URL personal** (que ya lleva su token):
+Con el auto-registro, tú (admin) solo compartes **dos cosas** con tu equipo: la URL `/enroll` y la **clave de invitación** (`ENROLL_SECRET`). Cada persona hace:
 
-1. En Claude → **Settings / Ajustes → Connectors / Conectores** → **Add custom connector**.
-2. **Name / Nombre**: `Odoo Proyectos`
-3. **URL**: `https://odoo-mcp.tudominio.com/mcp/<su-token>`
-4. Guardar. Listo: a partir de ahí Claude actúa en Odoo **como esa persona**. No hay que configurar cabeceras ni credenciales en Claude.
+1. **Genera su API key en Odoo:** su avatar → *Mi perfil* → *Seguridad de la cuenta* → *Nueva clave de API* → copia la clave. *(En Odoo Online, antes debe tener una contraseña establecida en su usuario.)*
+2. **Se registra:** abre `https://odoo-mcp.tudominio.com/enroll`, escribe la clave de invitación, su correo de Odoo y su API key, y pulsa **Generar mi enlace**.
+3. El servidor valida contra Odoo y le muestra su **URL personal**, tipo `https://odoo-mcp.tudominio.com/mcp/<su-token>`.
+4. **Conecta en Claude:** *Ajustes → Conectores → Añadir conector personalizado* → pega esa URL como **URL** del conector → Guardar.
 
-> El token va en la URL, pero la **API key no**: el servidor la resuelve internamente. Aun así, trata la URL personal como un secreto (quien la tenga actúa como ese usuario). Para revocar, borra la línea del usuario en `ODOO_USERS` y redepliega.
+Listo: a partir de ahí Claude actúa en Odoo **como esa persona**, sin cabeceras ni credenciales dentro de Claude.
+
+> **Revocar acceso:** borra la entrada del usuario en `/data/users.json` (o su API key en Odoo). Cambiar `ENROLL_SECRET` impide nuevos registros pero no afecta a los ya dados de alta.
 
 ---
 
