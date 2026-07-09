@@ -1,0 +1,16 @@
+# Secretos y entorno — NUNCA subir al repo
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Sistema / editor
+.DS_Store
+.idea/
+.vscode/
