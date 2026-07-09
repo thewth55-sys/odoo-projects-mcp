@@ -770,7 +770,7 @@ def list_tickets(
     if user_id is not None:
         domain.append(("user_id", "=", user_id))
     if only_open:
-        domain.append(("stage_id.is_close", "=", False))
+        domain.append(("stage_id.fold", "=", False))
     fields = ["id", "name", "team_id", "stage_id", "user_id", "partner_id",
               "priority", "kanban_state", "create_date"]
     return odoo.search_read("helpdesk.ticket", domain, fields, limit=limit, order="priority desc, create_date desc")
