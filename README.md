@@ -145,9 +145,18 @@ Ejemplos de cosas que le puedes pedir a Claude:
 
 ## 6. Notas de seguridad
 
-- **Nunca** pongas las API keys en el código ni en el repositorio: viven solo en la variable `ODOO_USERS` de Easypanel (y el `.env` está en `.gitignore`).
-- Sirve el MCP **siempre por HTTPS** (Easypanel lo hace por defecto): la URL con el token viaja cifrada.
-- La **API key nunca va en la URL**; el servidor la resuelve desde el token. Aun así, la URL personal es un secreto: quien la tenga actúa como ese usuario.
-- Los permisos efectivos son los del usuario de Odoo: para restringir a alguien (p. ej. solo lectura), ajusta su rol/grupos en Odoo.
-- Para **revocar** a una persona: borra su línea en `ODOO_USERS` (y/o su API key en Odoo) y vuelve a desplegar. No afecta al resto.
-- Una petición sin token o con un token desconocido es rechazada: **no hay acceso anónimo**.
+- **Cifrado en reposo:** define `MASTER_KEY` (clave Fernet) para que el archivo de usuarios se guarde **cifrado**. Sin ella, se guarda en texto plano (solo para pruebas). Genera la clave con `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` y guárdala fuera del repo.
+- **Cifrado en tránsito:** sirve el MCP **siempre por HTTPS** (Easypanel lo hace por defecto).
+- **La API key nunca va en la URL**; el servidor la resuelve desde el token. Aun así, la URL personal es un secreto: quien la tenga actúa como ese usuario.
+- **Rotación / caducidad:** con `TOKEN_TTL_DAYS` los enlaces caducan; re-registrarse invalida automáticamente el token anterior del mismo usuario.
+- **Rate limiting** por IP en `/enroll` (anti fuerza bruta) y en el endpoint MCP (`ENROLL_RATELIMIT`, `MCP_RATELIMIT`).
+- **Sin tokens en logs:** el access-log de uvicorn está desactivado para que los tokens (en la URL) no queden registrados. **Recomendado:** desactiva también el access-log del proxy (Traefik/Easypanel) o excluye el path `/mcp`.
+- **Borrado protegido:** `delete_*` requiere `ALLOW_DELETE=true` **y** `confirm=true` (mitiga borrados accidentales y prompt-injection). Por defecto, deshabilitado.
+- **Permisos por usuario:** los permisos efectivos son los del usuario de Odoo (grupos/ACLs). Para restringir a alguien, ajusta su rol en Odoo.
+- **Revocar** a una persona: borra su entrada en `users.json` (o su API key en Odoo). Cambiar `ENROLL_SECRET` bloquea nuevos registros.
+- Una petición sin token o con token desconocido/caducado es rechazada: **no hay acceso anónimo**.
+- **Dependencias fijadas** (`requirements.txt` con versiones exactas). Audita con `pip-audit -r requirements.txt`.
+
+### Responsabilidad del operador (fuera del código)
+- **Hardening del VPS** que corre Easypanel: parcheo del SO, SSH con llaves, firewall, backups **cifrados**, acceso restringido al panel.
+- **Cumplimiento de datos:** al usar este MCP, datos de Odoo (financieros, PII de clientes) se procesan en un LLM de terceros. Verifica el **acuerdo de tratamiento de datos (DPA)**, la residencia/retención y la clasificación de datos permitida antes de un uso amplio o con datos regulados.

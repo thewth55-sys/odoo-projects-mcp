@@ -42,14 +42,17 @@ import os
 import re
 import secrets
 import threading
+import time
 import xmlrpc.client
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any
 
 import anyio
+from cryptography.fernet import Fernet, InvalidToken
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import HTMLResponse
+from starlette.responses import HTMLResponse, PlainTextResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("odoo-mcp")
@@ -64,6 +67,10 @@ ODOO_DB = os.environ.get("ODOO_DB", "")                 # nombre de la base de d
 # El endpoint MCP se monta en este path. La URL de cada usuario será:
 #   https://<dominio><MCP_PATH>/<su-token>
 MCP_PATH = os.environ.get("MCP_PATH", "/mcp")
+
+# Borrado deshabilitado por defecto (mitiga borrados accidentales y prompt-injection).
+# Actívalo con ALLOW_DELETE=true solo si de verdad necesitas borrar vía MCP.
+ALLOW_DELETE = os.environ.get("ALLOW_DELETE", "false").strip().lower() in ("1", "true", "yes")
 
 if not ODOO_URL or not ODOO_DB:
     raise RuntimeError(
@@ -134,29 +141,75 @@ USERS_FILE = os.environ.get("ODOO_USERS_FILE", "/data/users.json")
 ENROLL_SECRET = os.environ.get("ENROLL_SECRET", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
+# --- Cifrado en reposo -----------------------------------------------------
+# MASTER_KEY es una clave Fernet (urlsafe base64, 32 bytes). Genera una con:
+#   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Si se define, el archivo de usuarios se guarda CIFRADO. Si no, se guarda en
+# texto plano (solo recomendable para pruebas) y se emite una advertencia.
+MASTER_KEY = os.environ.get("MASTER_KEY", "").strip()
+_fernet: Fernet | None = None
+if MASTER_KEY:
+    try:
+        _fernet = Fernet(MASTER_KEY.encode())
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(
+            "MASTER_KEY inválida. Debe ser una clave Fernet generada con "
+            "Fernet.generate_key(). Detalle: " + str(exc)
+        ) from exc
+else:
+    logger.warning(
+        "MASTER_KEY no definida: el archivo de usuarios se guardará SIN CIFRAR. "
+        "Define MASTER_KEY para cifrar los secretos en reposo."
+    )
+
+# --- Caducidad de tokens ---------------------------------------------------
+# Si TOKEN_TTL_DAYS > 0, los tokens auto-registrados caducan pasado ese plazo.
+try:
+    TOKEN_TTL_DAYS = int(os.environ.get("TOKEN_TTL_DAYS", "0"))
+except ValueError:
+    TOKEN_TTL_DAYS = 0
+
 _users_lock = threading.Lock()
 
 
-def _load_users_from_file() -> dict[str, dict[str, str]]:
+def _load_users_from_file() -> dict[str, dict[str, Any]]:
     try:
-        with open(USERS_FILE, encoding="utf-8") as fh:
-            data = json.load(fh)
+        with open(USERS_FILE, "rb") as fh:
+            raw = fh.read()
     except FileNotFoundError:
         return {}
-    except (json.JSONDecodeError, OSError) as exc:
+    except OSError as exc:
         logger.warning("No se pudo leer %s: %s", USERS_FILE, exc)
         return {}
-    return {
-        str(token): {"login": v["login"], "api_key": v["api_key"]}
-        for token, v in data.items()
-    }
+    if not raw.strip():
+        return {}
+    # Si hay clave, el archivo está cifrado; si no, es JSON plano.
+    if _fernet is not None:
+        try:
+            raw = _fernet.decrypt(raw)
+        except InvalidToken:
+            logger.error(
+                "No se pudo descifrar %s (¿MASTER_KEY equivocada o archivo en texto "
+                "plano?). Se ignora el archivo por seguridad.", USERS_FILE
+            )
+            return {}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logger.warning("Contenido inválido en %s: %s", USERS_FILE, exc)
+        return {}
+    return {str(token): dict(v) for token, v in data.items()}
 
 
-def _save_users_to_file(users: dict[str, dict[str, str]]) -> None:
+def _save_users_to_file(users: dict[str, dict[str, Any]]) -> None:
     os.makedirs(os.path.dirname(USERS_FILE) or ".", exist_ok=True)
+    payload = json.dumps(users, ensure_ascii=False, indent=2).encode("utf-8")
+    if _fernet is not None:
+        payload = _fernet.encrypt(payload)
     tmp = USERS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(users, fh, ensure_ascii=False, indent=2)
+    with open(tmp, "wb") as fh:
+        fh.write(payload)
+    os.chmod(tmp, 0o600)  # solo el dueño
     os.replace(tmp, USERS_FILE)  # escritura atómica
 
 
@@ -178,18 +231,96 @@ else:
 
 
 def _register_user(login: str, api_key: str) -> str:
-    """Añade un usuario y devuelve su token. Persiste en archivo y en memoria."""
-    token = secrets.token_urlsafe(12)
+    """Añade un usuario y devuelve su token nuevo. Persiste en archivo y memoria.
+
+    Rotación: si el mismo login ya tenía tokens auto-registrados, se ELIMINAN, de modo
+    que cada persona tiene un único token activo (re-registrarse invalida el anterior).
+    """
+    token = secrets.token_urlsafe(24)
+    entry = {
+        "login": login,
+        "api_key": api_key,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    login_low = login.strip().lower()
     with _users_lock:
         stored = _load_users_from_file()
-        stored[token] = {"login": login, "api_key": api_key}
+        # rotación: quita tokens previos del mismo login
+        for old in [t for t, v in stored.items() if v.get("login", "").strip().lower() == login_low]:
+            stored.pop(old, None)
+            USERS.pop(old, None)
+        stored[token] = entry
         _save_users_to_file(stored)
-        USERS[token] = {"login": login, "api_key": api_key}
+        USERS[token] = entry
     return token
+
+
+def _token_expired(entry: dict[str, Any]) -> bool:
+    """True si el token superó TOKEN_TTL_DAYS (si está activado y hay created_at)."""
+    if TOKEN_TTL_DAYS <= 0:
+        return False
+    created = entry.get("created_at")
+    if not created:
+        return False  # usuarios sembrados por env no caducan
+    try:
+        created_dt = datetime.fromisoformat(created)
+    except ValueError:
+        return False
+    age_days = (datetime.now(timezone.utc) - created_dt).total_seconds() / 86400
+    return age_days > TOKEN_TTL_DAYS
 
 
 # Token del usuario de la petición en curso (lo fija el middleware por cada request).
 _current_token: contextvars.ContextVar[str] = contextvars.ContextVar("odoo_token", default="")
+
+
+# --------------------------------------------------------------------------- #
+# Rate limiting (ventana deslizante por IP, en memoria)
+# --------------------------------------------------------------------------- #
+
+
+class _RateLimiter:
+    def __init__(self, max_calls: int, window_s: int):
+        self.max = max_calls
+        self.window = window_s
+        self._hits: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = time.time()
+        cutoff = now - self.window
+        with self._lock:
+            q = self._hits.setdefault(key, [])
+            while q and q[0] < cutoff:
+                q.pop(0)
+            if len(q) >= self.max:
+                return False
+            q.append(now)
+            return True
+
+
+def _rl_from_env(name: str, default: str) -> _RateLimiter:
+    """Lee 'N/segundos' de una variable de entorno (p.ej. '5/60')."""
+    raw = os.environ.get(name, default)
+    try:
+        calls, window = raw.split("/")
+        return _RateLimiter(int(calls), int(window))
+    except (ValueError, AttributeError):
+        calls, window = default.split("/")
+        return _RateLimiter(int(calls), int(window))
+
+
+# Límite estricto en /enroll (anti fuerza bruta / credential stuffing).
+_enroll_rl = _rl_from_env("ENROLL_RATELIMIT", "5/60")
+# Límite más holgado en el endpoint MCP.
+_mcp_rl = _rl_from_env("MCP_RATELIMIT", "240/60")
+
+
+def _client_ip(headers: dict[str, str], fallback: str = "unknown") -> str:
+    xff = headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return headers.get("x-real-ip", "").strip() or fallback
 
 
 # --------------------------------------------------------------------------- #
@@ -282,8 +413,13 @@ def _client_from_request() -> OdooClient:
     entry = USERS.get(token)
     if not entry:
         raise OdooError(
-            "Token no reconocido. Verifica que tu URL personal sea correcta o pide al "
-            "administrador que te dé de alta en la variable ODOO_USERS."
+            "Token no reconocido. Verifica que tu URL personal sea correcta o vuelve a "
+            "registrarte en /enroll."
+        )
+    if _token_expired(entry):
+        raise OdooError(
+            f"Tu enlace ha caducado (política de {TOKEN_TTL_DAYS} días). "
+            "Vuelve a registrarte en /enroll para generar uno nuevo."
         )
     return OdooClient(ODOO_URL, ODOO_DB, OdooCredentials(entry["login"], entry["api_key"]))
 
@@ -590,20 +726,37 @@ def create_milestone(name: str, project_id: int, deadline: str | None = None) ->
 # ------------------------------ BORRADO ------------------------------------ #
 
 
-@mcp.tool
-def delete_task(task_id: int) -> dict:
-    """Elimina una tarea de forma permanente. Úsalo con cuidado.
+def _guard_delete(confirm: bool) -> None:
+    """Barrera común para operaciones destructivas."""
+    if not ALLOW_DELETE:
+        raise OdooError(
+            "El borrado está deshabilitado en este servidor (ALLOW_DELETE=false). "
+            "Para 'quitar del medio' un elemento, archívalo con la herramienta de actualización."
+        )
+    if not confirm:
+        raise OdooError(
+            "Operación destructiva y permanente. Vuelve a llamar con confirm=true "
+            "para confirmar explícitamente el borrado."
+        )
 
-    Sugerencia: si solo quieres 'quitarla del medio', considera archivarla con
-    update_task en lugar de borrarla."""
+
+@mcp.tool
+def delete_task(task_id: int, confirm: bool = False) -> dict:
+    """Elimina una tarea de forma PERMANENTE. Requiere ALLOW_DELETE=true y confirm=true.
+
+    Sugerencia: si solo quieres 'quitarla del medio', archívala con update_task."""
+    _guard_delete(confirm)
     odoo = _client_from_request()
     odoo.unlink("project.task", [task_id])
     return {"deleted_id": task_id, "message": f"Tarea {task_id} eliminada permanentemente."}
 
 
 @mcp.tool
-def delete_project(project_id: int) -> dict:
-    """Elimina un proyecto de forma permanente, incluidas sus tareas. Operación peligrosa."""
+def delete_project(project_id: int, confirm: bool = False) -> dict:
+    """Elimina un proyecto de forma PERMANENTE (incluidas sus tareas).
+
+    Operación peligrosa. Requiere ALLOW_DELETE=true y confirm=true."""
+    _guard_delete(confirm)
     odoo = _client_from_request()
     odoo.unlink("project.project", [project_id])
     return {"deleted_id": project_id, "message": f"Proyecto {project_id} eliminado permanentemente."}
@@ -1214,6 +1367,13 @@ async def enroll_submit(request: Request) -> HTMLResponse:
     if not ENROLL_SECRET:
         return HTMLResponse("Registro deshabilitado.", status_code=403)
 
+    ip = _client_ip(dict(request.headers), request.client.host if request.client else "unknown")
+    if not _enroll_rl.allow(ip):
+        logger.warning("Rate limit de /enroll excedido por %s", ip)
+        return _render_form(
+            "<div class='msg err'>Demasiados intentos. Espera un minuto e inténtalo de nuevo.</div>"
+        )
+
     form = await request.form()
     invite = str(form.get("invite", "")).strip()
     login = str(form.get("login", "")).strip()
@@ -1269,6 +1429,15 @@ class TokenPathMiddleware:
         path = scope.get("path", "")
         token = ""
         if path.startswith(self.prefix):
+            # Rate limit por IP en el endpoint MCP.
+            hdrs = {k.decode("latin-1").lower(): v.decode("latin-1")
+                    for k, v in scope.get("headers", [])}
+            client = scope.get("client")
+            ip = _client_ip(hdrs, client[0] if client else "unknown")
+            if not _mcp_rl.allow(ip):
+                logger.warning("Rate limit de MCP excedido por %s", ip)
+                await PlainTextResponse("Too Many Requests", status_code=429)(scope, receive, send)
+                return
             token = path[len(self.prefix):].strip("/")
             scope = dict(scope)
             scope["path"] = self.mount_path
@@ -1293,5 +1462,6 @@ if __name__ == "__main__":
     app = TokenPathMiddleware(inner, mount_path=MCP_PATH)
 
     logger.info("Escuchando en http://%s:%s%s/<token>", host, port, MCP_PATH)
+    # access_log=False: evita que los tokens (en la URL) queden en los logs del servidor.
     # Se pasa el lifespan del app interno para que arranque el session manager de MCP.
-    uvicorn.run(app, host=host, port=port, lifespan="on")
+    uvicorn.run(app, host=host, port=port, lifespan="on", access_log=False)
