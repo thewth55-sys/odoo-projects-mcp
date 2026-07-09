@@ -111,20 +111,35 @@ Listo: a partir de ahí Claude actúa en Odoo **como esa persona**, sin cabecera
 
 ---
 
-## 5. Qué puede hacer Claude una vez conectado
+## 5. Módulos y nivel de acceso
 
-**Consultar:** `list_projects`, `get_project`, `list_tasks`, `get_task`, `list_stages`, `my_tasks`, `list_timesheets`, `list_milestones`, `find_users`.
+Los permisos efectivos siempre están limitados por el rol del usuario de Odoo. Además, el propio servidor solo expone estas capacidades:
 
-**Crear / editar:** `create_task`, `update_task`, `move_task_stage`, `create_project`, `log_timesheet`, `create_milestone`.
+| Módulo | Acceso | Herramientas |
+|---|---|---|
+| **Proyectos** | Lectura + escritura + borrado | `list_projects`, `get_project`, `list_tasks`, `get_task`, `list_stages`, `my_tasks`, `list_timesheets`, `list_milestones`, `create_task`, `update_task`, `move_task_stage`, `create_project`, `log_timesheet`, `create_milestone`, `delete_task`, `delete_project` |
+| **CRM** | Lectura + escritura | `list_leads`, `get_lead`, `create_lead`, `update_lead`, `move_lead_stage`, `list_crm_stages`, `list_crm_teams` |
+| **Soporte / Helpdesk** ⁽¹⁾ | Lectura + escritura | `list_tickets`, `get_ticket`, `create_ticket`, `update_ticket`, `move_ticket_stage`, `list_helpdesk_teams`, `list_helpdesk_stages` |
+| **Email Marketing** | Lectura + escritura ⁽²⁾ | `list_mailings`, `get_mailing`, `create_mailing_draft`, `list_mailing_lists`, `list_mailing_contacts`, `add_mailing_contact` |
+| **Automatización de Marketing** ⁽¹⁾ | Lectura + escritura | `list_marketing_campaigns`, `get_marketing_campaign`, `list_marketing_activities`, `set_marketing_campaign_state` |
+| **Tableros / Dashboards** | Solo lectura | `list_dashboard_groups`, `list_dashboards` |
+| **Ventas** | Solo lectura | `list_sales_orders`, `get_sales_order` |
+| **Contabilidad** | Solo lectura | `list_invoices`, `get_invoice` |
+| **Compras** | Solo lectura | `list_purchase_orders`, `get_purchase_order` |
+| **Gastos** | Solo lectura | `list_expenses`, `get_expense` |
+| **Utilidades** | Lectura | `find_users`, `find_partners` |
 
-**Borrar:** `delete_task`, `delete_project` *(permanente — úsalo con cuidado; para "quitar del medio" suele bastar con archivar vía `update_task`)*.
+⁽¹⁾ Helpdesk y Marketing Automation son apps de **Odoo Enterprise**; si no están instaladas, esas herramientas devolverán un error claro.
+⁽²⁾ `create_mailing_draft` crea el envío **en borrador**: el envío real se confirma manualmente desde Odoo (no se envían correos automáticamente).
+
+> Los módulos en **solo lectura** (Ventas, Contabilidad, Compras, Gastos) no exponen ninguna herramienta de crear/editar/borrar por diseño.
 
 Ejemplos de cosas que le puedes pedir a Claude:
-- "¿Qué tareas mías vencen esta semana?"
+- "¿Qué oportunidades abiertas tengo en el CRM por etapa?"
+- "Crea un ticket de soporte para el cliente X sobre un problema de facturación."
+- "¿Cuánto suman las facturas de cliente pendientes de pago este mes?" *(solo lectura)*
+- "Muéstrame los contactos de la lista de email marketing 'Newsletter'."
 - "Crea una tarea 'Revisar contrato' en el proyecto Alfa, asignada a María, para el viernes."
-- "Mueve la tarea 812 a la etapa 'En revisión'."
-- "Imputa 3 horas de hoy a la tarea 812: 'Ajustes de diseño'."
-- "Dame un resumen del avance del proyecto Alfa por etapa."
 
 ---
 

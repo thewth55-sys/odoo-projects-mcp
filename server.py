@@ -622,6 +622,510 @@ def find_users(query: str, limit: int = 10) -> list[dict]:
     return odoo.search_read("res.users", domain, ["id", "name", "login"], limit=limit)
 
 
+@mcp.tool
+def find_partners(query: str, limit: int = 10) -> list[dict]:
+    """Busca contactos/clientes (res.partner) por nombre, email o teléfono. Devuelve su id."""
+    odoo = _client_from_request()
+    domain = ["|", "|", ("name", "ilike", query), ("email", "ilike", query), ("phone", "ilike", query)]
+    return odoo.search_read(
+        "res.partner", domain, ["id", "name", "email", "phone", "is_company"], limit=limit
+    )
+
+
+# =========================================================================== #
+#  CRM  (lectura + escritura)                                    modelo crm.*  #
+# =========================================================================== #
+
+
+@mcp.tool
+def list_leads(
+    stage_id: int | None = None,
+    team_id: int | None = None,
+    user_id: int | None = None,
+    only_open: bool = True,
+    limit: int = 100,
+) -> list[dict]:
+    """Lista oportunidades/leads del CRM, con filtros opcionales por etapa, equipo o comercial."""
+    odoo = _client_from_request()
+    domain: list = []
+    if stage_id is not None:
+        domain.append(("stage_id", "=", stage_id))
+    if team_id is not None:
+        domain.append(("team_id", "=", team_id))
+    if user_id is not None:
+        domain.append(("user_id", "=", user_id))
+    if only_open:
+        domain.append(("active", "=", True))
+    fields = ["id", "name", "contact_name", "email_from", "phone", "partner_id",
+              "stage_id", "team_id", "user_id", "expected_revenue", "probability", "priority"]
+    return odoo.search_read("crm.lead", domain, fields, limit=limit, order="probability desc")
+
+
+@mcp.tool
+def get_lead(lead_id: int) -> dict:
+    """Detalle de una oportunidad/lead del CRM."""
+    odoo = _client_from_request()
+    fields = ["id", "name", "contact_name", "email_from", "phone", "partner_id", "stage_id",
+              "team_id", "user_id", "expected_revenue", "probability", "priority",
+              "date_deadline", "description", "type"]
+    rows = odoo.search_read("crm.lead", [("id", "=", lead_id)], fields)
+    if not rows:
+        raise OdooError(f"No existe una oportunidad con id {lead_id}.")
+    return rows[0]
+
+
+@mcp.tool
+def create_lead(
+    name: str,
+    contact_name: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    partner_id: int | None = None,
+    expected_revenue: float | None = None,
+    team_id: int | None = None,
+    user_id: int | None = None,
+    description: str | None = None,
+) -> dict:
+    """Crea una oportunidad en el CRM. 'name' es el título de la oportunidad."""
+    odoo = _client_from_request()
+    values: dict[str, Any] = {"name": name, "type": "opportunity"}
+    for key, val in (
+        ("contact_name", contact_name), ("email_from", email), ("phone", phone),
+        ("partner_id", partner_id), ("expected_revenue", expected_revenue),
+        ("team_id", team_id), ("user_id", user_id), ("description", description),
+    ):
+        if val is not None:
+            values[key] = val
+    new_id = odoo.create("crm.lead", values)
+    return {"created_id": new_id, "message": f"Oportunidad creada con id {new_id}."}
+
+
+@mcp.tool
+def update_lead(
+    lead_id: int,
+    name: str | None = None,
+    expected_revenue: float | None = None,
+    probability: float | None = None,
+    user_id: int | None = None,
+    description: str | None = None,
+) -> dict:
+    """Actualiza campos de una oportunidad. Solo cambia lo que envíes."""
+    odoo = _client_from_request()
+    values: dict[str, Any] = {}
+    for key, val in (
+        ("name", name), ("expected_revenue", expected_revenue),
+        ("probability", probability), ("user_id", user_id), ("description", description),
+    ):
+        if val is not None:
+            values[key] = val
+    if not values:
+        raise OdooError("No enviaste ningún campo para actualizar.")
+    odoo.write("crm.lead", [lead_id], values)
+    return {"updated_id": lead_id, "message": "Oportunidad actualizada."}
+
+
+@mcp.tool
+def move_lead_stage(lead_id: int, stage_id: int) -> dict:
+    """Mueve una oportunidad a otra etapa del pipeline de CRM."""
+    odoo = _client_from_request()
+    odoo.write("crm.lead", [lead_id], {"stage_id": stage_id})
+    return {"updated_id": lead_id, "message": f"Oportunidad movida a la etapa {stage_id}."}
+
+
+@mcp.tool
+def list_crm_stages() -> list[dict]:
+    """Lista las etapas del pipeline de CRM."""
+    odoo = _client_from_request()
+    return odoo.search_read("crm.stage", [], ["id", "name", "sequence"], order="sequence asc")
+
+
+@mcp.tool
+def list_crm_teams() -> list[dict]:
+    """Lista los equipos de ventas (CRM)."""
+    odoo = _client_from_request()
+    return odoo.search_read("crm.team", [], ["id", "name"], order="name asc")
+
+
+# =========================================================================== #
+#  SOPORTE AL CLIENTE / HELPDESK  (lectura + escritura)      modelo helpdesk.* #
+#  (Requiere el módulo Helpdesk, de Odoo Enterprise.)                          #
+# =========================================================================== #
+
+
+@mcp.tool
+def list_tickets(
+    team_id: int | None = None,
+    stage_id: int | None = None,
+    user_id: int | None = None,
+    only_open: bool = True,
+    limit: int = 100,
+) -> list[dict]:
+    """Lista tickets de soporte (Helpdesk), con filtros opcionales."""
+    odoo = _client_from_request()
+    domain: list = []
+    if team_id is not None:
+        domain.append(("team_id", "=", team_id))
+    if stage_id is not None:
+        domain.append(("stage_id", "=", stage_id))
+    if user_id is not None:
+        domain.append(("user_id", "=", user_id))
+    if only_open:
+        domain.append(("stage_id.is_close", "=", False))
+    fields = ["id", "name", "team_id", "stage_id", "user_id", "partner_id",
+              "priority", "kanban_state", "create_date"]
+    return odoo.search_read("helpdesk.ticket", domain, fields, limit=limit, order="priority desc, create_date desc")
+
+
+@mcp.tool
+def get_ticket(ticket_id: int) -> dict:
+    """Detalle de un ticket de soporte (Helpdesk)."""
+    odoo = _client_from_request()
+    fields = ["id", "name", "description", "team_id", "stage_id", "user_id", "partner_id",
+              "partner_email", "priority", "kanban_state", "ticket_type_id", "create_date"]
+    rows = odoo.search_read("helpdesk.ticket", [("id", "=", ticket_id)], fields)
+    if not rows:
+        raise OdooError(f"No existe un ticket con id {ticket_id}.")
+    return rows[0]
+
+
+@mcp.tool
+def create_ticket(
+    name: str,
+    description: str | None = None,
+    team_id: int | None = None,
+    partner_id: int | None = None,
+    user_id: int | None = None,
+    priority: str | None = None,
+) -> dict:
+    """Crea un ticket de soporte. 'name' es el asunto; priority '0'..'3'."""
+    odoo = _client_from_request()
+    values: dict[str, Any] = {"name": name}
+    for key, val in (
+        ("description", description), ("team_id", team_id), ("partner_id", partner_id),
+        ("user_id", user_id), ("priority", priority),
+    ):
+        if val is not None:
+            values[key] = val
+    new_id = odoo.create("helpdesk.ticket", values)
+    return {"created_id": new_id, "message": f"Ticket creado con id {new_id}."}
+
+
+@mcp.tool
+def update_ticket(
+    ticket_id: int,
+    name: str | None = None,
+    description: str | None = None,
+    user_id: int | None = None,
+    priority: str | None = None,
+    kanban_state: str | None = None,
+) -> dict:
+    """Actualiza campos de un ticket. Solo cambia lo que envíes."""
+    odoo = _client_from_request()
+    values: dict[str, Any] = {}
+    for key, val in (
+        ("name", name), ("description", description), ("user_id", user_id),
+        ("priority", priority), ("kanban_state", kanban_state),
+    ):
+        if val is not None:
+            values[key] = val
+    if not values:
+        raise OdooError("No enviaste ningún campo para actualizar.")
+    odoo.write("helpdesk.ticket", [ticket_id], values)
+    return {"updated_id": ticket_id, "message": "Ticket actualizado."}
+
+
+@mcp.tool
+def move_ticket_stage(ticket_id: int, stage_id: int) -> dict:
+    """Mueve un ticket a otra etapa del Helpdesk."""
+    odoo = _client_from_request()
+    odoo.write("helpdesk.ticket", [ticket_id], {"stage_id": stage_id})
+    return {"updated_id": ticket_id, "message": f"Ticket movido a la etapa {stage_id}."}
+
+
+@mcp.tool
+def list_helpdesk_teams() -> list[dict]:
+    """Lista los equipos de Helpdesk."""
+    odoo = _client_from_request()
+    return odoo.search_read("helpdesk.team", [], ["id", "name"], order="name asc")
+
+
+@mcp.tool
+def list_helpdesk_stages() -> list[dict]:
+    """Lista las etapas del Helpdesk."""
+    odoo = _client_from_request()
+    return odoo.search_read("helpdesk.stage", [], ["id", "name", "sequence"], order="sequence asc")
+
+
+# =========================================================================== #
+#  EMAIL MARKETING  (lectura + escritura)                       modelo mailing.* #
+#  Nota: crear envíos queda en BORRADOR; el envío se confirma en Odoo.          #
+# =========================================================================== #
+
+
+@mcp.tool
+def list_mailings(limit: int = 50) -> list[dict]:
+    """Lista campañas de email marketing (envíos)."""
+    odoo = _client_from_request()
+    fields = ["id", "subject", "state", "sent_date", "sent", "delivered", "opened"]
+    return odoo.search_read("mailing.mailing", [], fields, limit=limit, order="create_date desc")
+
+
+@mcp.tool
+def get_mailing(mailing_id: int) -> dict:
+    """Detalle de un envío de email marketing (métricas y estado)."""
+    odoo = _client_from_request()
+    fields = ["id", "subject", "state", "sent_date", "sent", "delivered", "opened",
+              "clicked", "bounced", "contact_list_ids"]
+    rows = odoo.search_read("mailing.mailing", [("id", "=", mailing_id)], fields)
+    if not rows:
+        raise OdooError(f"No existe un envío con id {mailing_id}.")
+    return rows[0]
+
+
+@mcp.tool
+def create_mailing_draft(subject: str, body_html: str, contact_list_ids: list[int]) -> dict:
+    """Crea un envío de email marketing EN BORRADOR dirigido a una o más listas de contactos.
+
+    No se envía: queda en estado borrador para revisar y confirmar el envío desde Odoo.
+    """
+    odoo = _client_from_request()
+    values = {
+        "subject": subject,
+        "body_arch": body_html,
+        "body_html": body_html,
+        "mailing_model_real": "mailing.list",
+        "contact_list_ids": [(6, 0, contact_list_ids)],
+    }
+    new_id = odoo.create("mailing.mailing", values)
+    return {"created_id": new_id, "message": f"Envío creado EN BORRADOR con id {new_id}. Revísalo y envíalo desde Odoo."}
+
+
+@mcp.tool
+def list_mailing_lists() -> list[dict]:
+    """Lista las listas de contactos de email marketing."""
+    odoo = _client_from_request()
+    return odoo.search_read("mailing.list", [], ["id", "name", "contact_count"], order="name asc")
+
+
+@mcp.tool
+def list_mailing_contacts(list_id: int | None = None, limit: int = 100) -> list[dict]:
+    """Lista contactos de email marketing, opcionalmente de una lista concreta."""
+    odoo = _client_from_request()
+    domain = [] if list_id is None else [("list_ids", "in", [list_id])]
+    return odoo.search_read("mailing.contact", domain, ["id", "name", "email"], limit=limit)
+
+
+@mcp.tool
+def add_mailing_contact(name: str, email: str, list_ids: list[int]) -> dict:
+    """Añade un contacto a una o más listas de email marketing."""
+    odoo = _client_from_request()
+    values = {"name": name, "email": email, "list_ids": [(6, 0, list_ids)]}
+    new_id = odoo.create("mailing.contact", values)
+    return {"created_id": new_id, "message": f"Contacto creado con id {new_id}."}
+
+
+# =========================================================================== #
+#  AUTOMATIZACIÓN DE MARKETING  (lectura + escritura)         modelo marketing.* #
+#  (Requiere el módulo Marketing Automation, de Odoo Enterprise.)              #
+# =========================================================================== #
+
+
+@mcp.tool
+def list_marketing_campaigns(limit: int = 50) -> list[dict]:
+    """Lista campañas de automatización de marketing."""
+    odoo = _client_from_request()
+    fields = ["id", "name", "state", "model_id", "running_participant_count", "total_participant_count"]
+    return odoo.search_read("marketing.campaign", [], fields, limit=limit, order="create_date desc")
+
+
+@mcp.tool
+def get_marketing_campaign(campaign_id: int) -> dict:
+    """Detalle de una campaña de automatización de marketing."""
+    odoo = _client_from_request()
+    fields = ["id", "name", "state", "model_id", "running_participant_count",
+              "total_participant_count", "completed_participant_count"]
+    rows = odoo.search_read("marketing.campaign", [("id", "=", campaign_id)], fields)
+    if not rows:
+        raise OdooError(f"No existe una campaña con id {campaign_id}.")
+    return rows[0]
+
+
+@mcp.tool
+def list_marketing_activities(campaign_id: int) -> list[dict]:
+    """Lista las actividades (pasos) de una campaña de automatización de marketing."""
+    odoo = _client_from_request()
+    fields = ["id", "name", "activity_type", "trigger_type", "interval_number", "interval_type"]
+    return odoo.search_read("marketing.activity", [("campaign_id", "=", campaign_id)], fields)
+
+
+@mcp.tool
+def set_marketing_campaign_state(campaign_id: int, state: str) -> dict:
+    """Cambia el estado de una campaña de automatización: 'draft', 'running' o 'stopped'."""
+    odoo = _client_from_request()
+    if state not in ("draft", "running", "stopped"):
+        raise OdooError("Estado inválido. Usa 'draft', 'running' o 'stopped'.")
+    odoo.write("marketing.campaign", [campaign_id], {"state": state})
+    return {"updated_id": campaign_id, "message": f"Campaña en estado '{state}'."}
+
+
+# =========================================================================== #
+#  TABLEROS / DASHBOARDS  (lectura)                        modelo spreadsheet.* #
+# =========================================================================== #
+
+
+@mcp.tool
+def list_dashboard_groups() -> list[dict]:
+    """Lista los grupos de tableros (Dashboards)."""
+    odoo = _client_from_request()
+    return odoo.search_read("spreadsheet.dashboard.group", [], ["id", "name"], order="sequence asc")
+
+
+@mcp.tool
+def list_dashboards(group_id: int | None = None) -> list[dict]:
+    """Lista los tableros (Dashboards), opcionalmente de un grupo concreto."""
+    odoo = _client_from_request()
+    domain = [] if group_id is None else [("dashboard_group_id", "=", group_id)]
+    return odoo.search_read(
+        "spreadsheet.dashboard", domain, ["id", "name", "dashboard_group_id"], order="sequence asc"
+    )
+
+
+# =========================================================================== #
+#  VENTAS  (SOLO LECTURA)                                       modelo sale.*  #
+# =========================================================================== #
+
+
+@mcp.tool
+def list_sales_orders(
+    partner_id: int | None = None, state: str | None = None, limit: int = 100
+) -> list[dict]:
+    """Lista pedidos de venta (solo lectura). state: 'draft','sent','sale','done','cancel'."""
+    odoo = _client_from_request()
+    domain: list = []
+    if partner_id is not None:
+        domain.append(("partner_id", "=", partner_id))
+    if state is not None:
+        domain.append(("state", "=", state))
+    fields = ["id", "name", "partner_id", "date_order", "amount_total", "state", "user_id"]
+    return odoo.search_read("sale.order", domain, fields, limit=limit, order="date_order desc")
+
+
+@mcp.tool
+def get_sales_order(order_id: int) -> dict:
+    """Detalle de un pedido de venta con sus líneas (solo lectura)."""
+    odoo = _client_from_request()
+    fields = ["id", "name", "partner_id", "date_order", "amount_untaxed", "amount_tax",
+              "amount_total", "state", "user_id", "order_line"]
+    rows = odoo.search_read("sale.order", [("id", "=", order_id)], fields)
+    if not rows:
+        raise OdooError(f"No existe un pedido de venta con id {order_id}.")
+    return rows[0]
+
+
+# =========================================================================== #
+#  CONTABILIDAD  (SOLO LECTURA)                              modelo account.*  #
+# =========================================================================== #
+
+
+@mcp.tool
+def list_invoices(
+    move_type: str = "out_invoice",
+    state: str | None = None,
+    partner_id: int | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Lista facturas/documentos contables (solo lectura).
+
+    move_type: 'out_invoice' (factura cliente), 'in_invoice' (factura proveedor),
+    'out_refund', 'in_refund', 'entry' (asiento).
+    """
+    odoo = _client_from_request()
+    domain: list = [("move_type", "=", move_type)]
+    if state is not None:
+        domain.append(("state", "=", state))
+    if partner_id is not None:
+        domain.append(("partner_id", "=", partner_id))
+    fields = ["id", "name", "partner_id", "invoice_date", "amount_total",
+              "state", "payment_state"]
+    return odoo.search_read("account.move", domain, fields, limit=limit, order="invoice_date desc")
+
+
+@mcp.tool
+def get_invoice(move_id: int) -> dict:
+    """Detalle de una factura/documento contable (solo lectura)."""
+    odoo = _client_from_request()
+    fields = ["id", "name", "partner_id", "invoice_date", "invoice_date_due", "amount_untaxed",
+              "amount_tax", "amount_total", "amount_residual", "state", "payment_state", "move_type"]
+    rows = odoo.search_read("account.move", [("id", "=", move_id)], fields)
+    if not rows:
+        raise OdooError(f"No existe un documento contable con id {move_id}.")
+    return rows[0]
+
+
+# =========================================================================== #
+#  COMPRAS  (SOLO LECTURA)                                  modelo purchase.*  #
+# =========================================================================== #
+
+
+@mcp.tool
+def list_purchase_orders(
+    partner_id: int | None = None, state: str | None = None, limit: int = 100
+) -> list[dict]:
+    """Lista órdenes de compra (solo lectura). state: 'draft','sent','purchase','done','cancel'."""
+    odoo = _client_from_request()
+    domain: list = []
+    if partner_id is not None:
+        domain.append(("partner_id", "=", partner_id))
+    if state is not None:
+        domain.append(("state", "=", state))
+    fields = ["id", "name", "partner_id", "date_order", "amount_total", "state"]
+    return odoo.search_read("purchase.order", domain, fields, limit=limit, order="date_order desc")
+
+
+@mcp.tool
+def get_purchase_order(order_id: int) -> dict:
+    """Detalle de una orden de compra (solo lectura)."""
+    odoo = _client_from_request()
+    fields = ["id", "name", "partner_id", "date_order", "amount_untaxed", "amount_tax",
+              "amount_total", "state", "order_line"]
+    rows = odoo.search_read("purchase.order", [("id", "=", order_id)], fields)
+    if not rows:
+        raise OdooError(f"No existe una orden de compra con id {order_id}.")
+    return rows[0]
+
+
+# =========================================================================== #
+#  GASTOS  (SOLO LECTURA)                                    modelo hr.expense #
+# =========================================================================== #
+
+
+@mcp.tool
+def list_expenses(
+    employee_id: int | None = None, state: str | None = None, limit: int = 100
+) -> list[dict]:
+    """Lista gastos (solo lectura). state: 'draft','reported','approved','done','refused'."""
+    odoo = _client_from_request()
+    domain: list = []
+    if employee_id is not None:
+        domain.append(("employee_id", "=", employee_id))
+    if state is not None:
+        domain.append(("state", "=", state))
+    fields = ["id", "name", "employee_id", "total_amount", "state", "date", "product_id"]
+    return odoo.search_read("hr.expense", domain, fields, limit=limit, order="date desc")
+
+
+@mcp.tool
+def get_expense(expense_id: int) -> dict:
+    """Detalle de un gasto (solo lectura)."""
+    odoo = _client_from_request()
+    fields = ["id", "name", "employee_id", "total_amount", "untaxed_amount", "state",
+              "date", "product_id", "description"]
+    rows = odoo.search_read("hr.expense", [("id", "=", expense_id)], fields)
+    if not rows:
+        raise OdooError(f"No existe un gasto con id {expense_id}.")
+    return rows[0]
+
+
 # --------------------------------------------------------------------------- #
 # Arranque
 # --------------------------------------------------------------------------- #
