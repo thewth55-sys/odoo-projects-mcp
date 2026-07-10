@@ -493,9 +493,9 @@ def list_tasks(
     if assignee_id is not None:
         domain.append(("user_ids", "in", [assignee_id]))
     if only_open:
-        domain.append(("is_closed", "=", False))
+        domain.append(("stage_id.fold", "=", False))
     fields = ["id", "name", "project_id", "stage_id", "user_ids", "date_deadline",
-              "priority", "kanban_state", "planned_hours", "effective_hours"]
+              "priority", "state", "planned_hours", "effective_hours"]
     return odoo.search_read("project.task", domain, fields, limit=limit, order="priority desc, date_deadline asc")
 
 
@@ -504,8 +504,8 @@ def get_task(task_id: int) -> dict:
     """Devuelve el detalle completo de una tarea por su id."""
     odoo = _client_from_request()
     fields = ["id", "name", "project_id", "stage_id", "user_ids", "partner_id",
-              "date_deadline", "priority", "kanban_state", "description",
-              "planned_hours", "effective_hours", "tag_ids", "is_closed", "child_ids"]
+              "date_deadline", "priority", "state", "description",
+              "planned_hours", "effective_hours", "tag_ids", "child_ids"]
     rows = odoo.search_read("project.task", [("id", "=", task_id)], fields)
     if not rows:
         raise OdooError(f"No existe una tarea con id {task_id}.")
@@ -528,8 +528,8 @@ def my_tasks(only_open: bool = True, limit: int = 100) -> list[dict]:
     odoo = _client_from_request()
     domain: list = [("user_ids", "in", [odoo.uid])]
     if only_open:
-        domain.append(("is_closed", "=", False))
-    fields = ["id", "name", "project_id", "stage_id", "date_deadline", "priority", "kanban_state"]
+        domain.append(("stage_id.fold", "=", False))
+    fields = ["id", "name", "project_id", "stage_id", "date_deadline", "priority", "state"]
     return odoo.search_read("project.task", domain, fields, limit=limit, order="date_deadline asc")
 
 
@@ -610,13 +610,15 @@ def update_task(
     deadline: str | None = None,
     priority: str | None = None,
     planned_hours: float | None = None,
-    kanban_state: str | None = None,
+    state: str | None = None,
 ) -> dict:
     """Actualiza campos de una tarea existente. Solo se cambian los campos que envíes.
 
     Args:
         task_id: id de la tarea.
-        kanban_state: 'normal', 'done' (verde) o 'blocked' (rojo).
+        state: estado de la tarea en Odoo 17+: '01_in_progress' (en curso),
+            '02_changes_requested' (cambios), '03_approved' (aprobada),
+            '04_waiting_normal' (en espera), '1_done' (hecha), '1_canceled' (cancelada).
         (resto de argumentos: ver create_task)
     """
     odoo = _client_from_request()
@@ -633,8 +635,8 @@ def update_task(
         values["priority"] = priority
     if planned_hours is not None:
         values["planned_hours"] = planned_hours
-    if kanban_state is not None:
-        values["kanban_state"] = kanban_state
+    if state is not None:
+        values["state"] = state
     if not values:
         raise OdooError("No enviaste ningún campo para actualizar.")
     odoo.write("project.task", [task_id], values)
