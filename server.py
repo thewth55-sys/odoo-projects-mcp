@@ -495,7 +495,7 @@ def list_tasks(
     if only_open:
         domain.append(("stage_id.fold", "=", False))
     fields = ["id", "name", "project_id", "stage_id", "user_ids", "date_deadline",
-              "priority", "state", "planned_hours", "effective_hours"]
+              "priority", "state", "allocated_hours", "effective_hours"]
     return odoo.search_read("project.task", domain, fields, limit=limit, order="priority desc, date_deadline asc")
 
 
@@ -505,7 +505,7 @@ def get_task(task_id: int) -> dict:
     odoo = _client_from_request()
     fields = ["id", "name", "project_id", "stage_id", "user_ids", "partner_id",
               "date_deadline", "priority", "state", "description",
-              "planned_hours", "effective_hours", "tag_ids", "child_ids"]
+              "allocated_hours", "effective_hours", "tag_ids", "child_ids"]
     rows = odoo.search_read("project.task", [("id", "=", task_id)], fields)
     if not rows:
         raise OdooError(f"No existe una tarea con id {task_id}.")
@@ -596,7 +596,7 @@ def create_task(
     if priority is not None:
         values["priority"] = priority
     if planned_hours is not None:
-        values["planned_hours"] = planned_hours
+        values["allocated_hours"] = planned_hours
     new_id = odoo.create("project.task", values)
     return {"created_id": new_id, "message": f"Tarea creada con id {new_id}."}
 
@@ -634,7 +634,7 @@ def update_task(
     if priority is not None:
         values["priority"] = priority
     if planned_hours is not None:
-        values["planned_hours"] = planned_hours
+        values["allocated_hours"] = planned_hours
     if state is not None:
         values["state"] = state
     if not values:
