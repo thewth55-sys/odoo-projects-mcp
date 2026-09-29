@@ -651,6 +651,164 @@ def move_task_stage(task_id: int, stage_id: int) -> dict:
     return {"updated_id": task_id, "message": f"Tarea movida a la etapa {stage_id}."}
 
 
+# ------------------------------ SUBTAREAS ---------------------------------- #
+
+
+@mcp.tool
+def create_subtask(
+    parent_task_id: int,
+    name: str,
+    description: str | None = None,
+    assignee_ids: list[int] | None = None,
+    deadline: str | None = None,
+    priority: str | None = None,
+) -> dict:
+    """Crea una subtarea bajo una tarea existente.
+
+    La subtarea hereda el proyecto de la tarea padre.
+
+    Args:
+        parent_task_id: id de la tarea padre.
+        name: título de la subtarea.
+        description: descripción (HTML o texto plano).
+        assignee_ids: ids de usuarios asignados (res.users).
+        deadline: fecha límite 'YYYY-MM-DD'.
+        priority: '0' (normal) o '1' (importante).
+    """
+    odoo = _client_from_request()
+    parent = odoo.search_read("project.task", [("id", "=", parent_task_id)], ["project_id"])
+    if not parent:
+        raise OdooError(f"No existe la tarea padre con id {parent_task_id}.")
+    values: dict[str, Any] = {"name": name, "parent_id": parent_task_id}
+    if parent[0].get("project_id"):
+        values["project_id"] = parent[0]["project_id"][0]
+    if description is not None:
+        values["description"] = description
+    if assignee_ids:
+        values["user_ids"] = [(6, 0, assignee_ids)]
+    if deadline is not None:
+        values["date_deadline"] = deadline
+    if priority is not None:
+        values["priority"] = priority
+    new_id = odoo.create("project.task", values)
+    return {"created_id": new_id, "message": f"Subtarea creada con id {new_id} bajo la tarea {parent_task_id}."}
+
+
+@mcp.tool
+def list_subtasks(parent_task_id: int) -> list[dict]:
+    """Lista las subtareas de una tarea."""
+    odoo = _client_from_request()
+    fields = ["id", "name", "stage_id", "user_ids", "date_deadline", "priority", "state"]
+    return odoo.search_read(
+        "project.task", [("parent_id", "=", parent_task_id)], fields, order="priority desc"
+    )
+
+
+# ------------------------------ ETIQUETAS ---------------------------------- #
+
+
+@mcp.tool
+def list_project_tags(query: str | None = None, limit: int = 100) -> list[dict]:
+    """Lista las etiquetas de proyecto disponibles (project.tags). Filtra por nombre si das query."""
+    odoo = _client_from_request()
+    domain = [] if not query else [("name", "ilike", query)]
+    return odoo.search_read("project.tags", domain, ["id", "name", "color"], limit=limit, order="name asc")
+
+
+@mcp.tool
+def create_project_tag(name: str, color: int | None = None) -> dict:
+    """Crea una etiqueta de proyecto nueva. color: índice 0-11 del color de Odoo (opcional)."""
+    odoo = _client_from_request()
+    values: dict[str, Any] = {"name": name}
+    if color is not None:
+        values["color"] = color
+    new_id = odoo.create("project.tags", values)
+    return {"created_id": new_id, "message": f"Etiqueta '{name}' creada con id {new_id}."}
+
+
+@mcp.tool
+def add_task_tags(task_id: int, tags: list[str]) -> dict:
+    """Añade etiquetas a una tarea por NOMBRE (sin quitar las existentes).
+
+    Cada nombre que no exista como etiqueta se crea automáticamente.
+    """
+    odoo = _client_from_request()
+    tag_ids: list[int] = []
+    for name in tags:
+        name = name.strip()
+        if not name:
+            continue
+        found = odoo.search_read("project.tags", [("name", "=", name)], ["id"], limit=1)
+        tag_ids.append(found[0]["id"] if found else odoo.create("project.tags", {"name": name}))
+    if not tag_ids:
+        raise OdooError("No enviaste ninguna etiqueta válida.")
+    odoo.write("project.task", [task_id], {"tag_ids": [(4, tid) for tid in tag_ids]})
+    return {"updated_id": task_id, "message": f"Etiquetas añadidas a la tarea {task_id}: {', '.join(tags)}."}
+
+
+@mcp.tool
+def remove_task_tag(task_id: int, tag_id: int) -> dict:
+    """Quita una etiqueta de una tarea (no borra la etiqueta del sistema)."""
+    odoo = _client_from_request()
+    odoo.write("project.task", [task_id], {"tag_ids": [(3, tag_id)]})
+    return {"updated_id": task_id, "message": f"Etiqueta {tag_id} quitada de la tarea {task_id}."}
+
+
+# ------------------------------ ETAPAS ------------------------------------- #
+
+
+@mcp.tool
+def create_stage(name: str, project_id: int | None = None, sequence: int | None = None) -> dict:
+    """Crea una etapa/columna de kanban (project.task.type).
+
+    Args:
+        name: nombre de la etapa.
+        project_id: si se indica, asocia la etapa a ese proyecto.
+        sequence: orden de la etapa (menor = más a la izquierda).
+    """
+    odoo = _client_from_request()
+    values: dict[str, Any] = {"name": name}
+    if sequence is not None:
+        values["sequence"] = sequence
+    if project_id is not None:
+        values["project_ids"] = [(4, project_id)]
+    new_id = odoo.create("project.task.type", values)
+    return {"created_id": new_id, "message": f"Etapa '{name}' creada con id {new_id}."}
+
+
+@mcp.tool
+def update_stage(
+    stage_id: int,
+    name: str | None = None,
+    sequence: int | None = None,
+    fold: bool | None = None,
+    add_to_project_id: int | None = None,
+) -> dict:
+    """Renombra o ajusta una etapa existente.
+
+    Args:
+        stage_id: id de la etapa.
+        name: nuevo nombre (renombrar).
+        sequence: nuevo orden.
+        fold: True para plegar la columna (etapa "cerrada"), False para desplegarla.
+        add_to_project_id: asocia además la etapa a este proyecto.
+    """
+    odoo = _client_from_request()
+    values: dict[str, Any] = {}
+    if name is not None:
+        values["name"] = name
+    if sequence is not None:
+        values["sequence"] = sequence
+    if fold is not None:
+        values["fold"] = fold
+    if add_to_project_id is not None:
+        values["project_ids"] = [(4, add_to_project_id)]
+    if not values:
+        raise OdooError("No enviaste ningún campo para actualizar.")
+    odoo.write("project.task.type", [stage_id], values)
+    return {"updated_id": stage_id, "message": "Etapa actualizada."}
+
+
 @mcp.tool
 def create_project(
     name: str,
